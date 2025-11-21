@@ -1,0 +1,559 @@
+"use client"
+
+import { useState, useEffect, useRef } from "react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import type { Language, StoryState } from "@/app/page"
+import StageHeader from "@/components/stage-header"
+import { Loader2, Send } from "lucide-react"
+import { toast } from "sonner"
+
+interface PlotBrainstormProps {
+  language: Language
+  character: StoryState["character"] | null
+  onPlotCreate: (plot: StoryState["plot"]) => void
+  onBack: () => void
+  userId?: string
+}
+
+interface Message {
+  role: "ai" | "user"
+  content: string
+  suggestions?: string[]
+}
+
+export default function PlotBrainstorm({ language, character, onPlotCreate, onBack, userId }: PlotBrainstormProps) {
+  const [messages, setMessages] = useState<Message[]>([])
+  const [input, setInput] = useState("")
+  const [isLoading, setIsLoading] = useState(false)
+  const [conversationId, setConversationId] = useState<string | null>(null)
+  const [plotData, setPlotData] = useState<{ setting: string; conflict: string; goal: string }>({
+    setting: "",
+    conflict: "",
+    goal: "",
+  })
+  const [updatingFields, setUpdatingFields] = useState<Set<string>>(new Set())
+  const [summaryConversationId, setSummaryConversationId] = useState<string | null>(null)
+  const [summaryDone, setSummaryDone] = useState(false)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    sendInitialMessage()
+  }, [])
+
+  useEffect(() => {
+    scrollToBottom()
+  }, [messages])
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }
+
+  const extractLastSixWords = (text: string): { words: string[], cleanedText: string } => {
+    // 分割单词，去除逗号和其他标点符号
+    const words = text.trim()
+      .split(/\s+|[,，、]/) // 支持空格、英文逗号、中文逗号、顿号分隔
+      .map(word => word.replace(/[,，、。.!?！？;；:：]/g, '').trim()) // 去除标点符号
+      .filter(word => word.length > 0) // 过滤空字符串
+    if (words.length <= 6) {
+      return { words, cleanedText: "" }
+    }
+    const lastSix = words.slice(-6)
+    const cleanedText = words.slice(0, -6).join(" ").trim()
+    return { words: lastSix, cleanedText }
+  }
+
+  const sendInitialMessage = async () => {
+    setIsLoading(true)
+    try {
+      let initialPrompt = ""
+      if (character) {
+        // 构建详细的角色信息
+        const characterInfo = [
+          `Character name: ${character.name}`,
+          character.species ? `Species: ${character.species}` : "",
+          character.traits && character.traits.length > 0 ? `Traits: ${character.traits.join(", ")}` : "",
+          character.description ? `Description: ${character.description}` : "",
+        ].filter(Boolean).join("\n")
+        
+        // 新的设定：脑图机器人，面向小学生，六个单词收尾
+        initialPrompt = `You are a mind map robot helping elementary school students with plot writing. Use simple, kid-friendly language. 
+
+Here's the character information the student created:
+${characterInfo}
+
+Start by asking: "Where does this story take place?" (in Chinese: 这个故事发生在哪呢？) Then end your response with exactly six words related to story settings (like: school, home, forest, park, beach, library). Don't say "Here are six words" or mention "six words" - just put the six words at the end of your response.
+
+Continue guiding the student step by step. Each response should end with exactly six words related to the current topic. When the conversation can fully describe a complete story, say: "The plot is getting clearer! Anything else you'd like to talk about?" (in Chinese: 故事情节已经比较清晰了，还想再聊些什么吗？)
+
+Remember: Always end with exactly six words, use simple language, and guide step by step.`
+      } else {
+        initialPrompt = `You are a mind map robot helping elementary school students with plot writing. Use simple, kid-friendly language. Start by asking: "Where does this story take place?" (in Chinese: 这个故事发生在哪呢？) Then end your response with exactly six words related to story settings. Continue guiding step by step, always ending with exactly six words.`
+      }
+
+      const response = await fetch("/api/dify-chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: initialPrompt,
+          conversation_id: conversationId,
+          user_id: userId || "default-user",
+        }),
+      })
+
+      const data = await response.json()
+
+      if (data.error) {
+        toast.error(data.error)
+        return
+      }
+
+      const aiMessage = data.answer || "Hello! Let's start brainstorming your plot."
+      const { words: suggestions, cleanedText } = extractLastSixWords(aiMessage)
+
+      const initialMessages: Message[] = [{ role: "ai", content: cleanedText || aiMessage, suggestions }]
+      setMessages(initialMessages)
+      setConversationId(data.conversation_id)
+      
+      // 初始消息是AI说的，不调用总结API
+      // 只有在学生回答后才会调用总结API
+    } catch (error) {
+      console.error("Error sending initial message:", error)
+      toast.error("Failed to start conversation")
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const sendMessage = async (messageText: string) => {
+    if (!messageText.trim() || isLoading) return
+
+    const userMessage: Message = { role: "user", content: messageText }
+    setMessages((prev) => [...prev, userMessage])
+    setInput("")
+    setIsLoading(true)
+
+    try {
+      const response = await fetch("/api/dify-chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: messageText,
+          conversation_id: conversationId,
+          user_id: userId || "default-user",
+        }),
+      })
+
+      const data = await response.json()
+
+      if (data.error) {
+        toast.error(data.error)
+        setIsLoading(false)
+        return
+      }
+
+      const aiMessage = data.answer || ""
+      const { words: suggestions, cleanedText } = extractLastSixWords(aiMessage)
+
+      const updatedMessages = [...messages, userMessage, { role: "ai" as const, content: cleanedText || aiMessage, suggestions }]
+      setMessages(updatedMessages)
+      setConversationId(data.conversation_id)
+
+      // 保存对话内容到interactions API
+      if (userId) {
+        fetch("/api/interactions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            user_id: userId,
+            stage: "plot",
+            input: {
+              messages: updatedMessages.map((msg) => ({
+                role: msg.role,
+                content: msg.content,
+              })),
+            },
+            output: {
+              plotData: plotData,
+            },
+          }),
+        }).catch((error) => {
+          console.error("Error saving plot conversation:", error)
+        })
+      }
+
+      // 只有在学生发送消息后，才调用总结API来提取Setting, Conflict, Goal
+      // 因为学生提供了新信息，需要重新分析对话
+      await summarizePlot(updatedMessages)
+    } catch (error) {
+      console.error("Error sending message:", error)
+      toast.error("Failed to send message")
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const summarizePlot = async (messageHistory?: Message[]) => {
+    try {
+      // 使用传入的消息历史，如果没有则使用当前messages
+      const messagesToUse = messageHistory || messages
+      
+      // 只有当有对话历史时才调用总结API
+      if (messagesToUse.length === 0) {
+        console.log("No messages to summarize")
+        return
+      }
+      
+      // 构建对话历史（包含所有对话内容）
+      const conversationHistory = messagesToUse.map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      }))
+
+      console.log("Calling plot summary API with", conversationHistory.length, "messages")
+
+      const response = await fetch("/api/dify-plot-summary", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          conversation_history: conversationHistory,
+          conversation_id: summaryConversationId || undefined, // 使用总结机器人的conversation_id，保持对话上下文
+          user_id: userId || "default-user",
+        }),
+      })
+
+      const data = await response.json()
+
+      console.log("Plot summary API response:", data)
+
+      // 保存总结机器人的conversation_id
+      if (data.conversation_id && !summaryConversationId) {
+        setSummaryConversationId(data.conversation_id)
+      }
+
+      if (data.error) {
+        // 如果信息不足，总结API不会返回结果，这是正常的
+        console.log("Plot summary not ready yet:", data.error)
+        return
+      }
+
+      const summary = data.summary || ""
+      
+      console.log("Plot summary result:", summary)
+      
+      // 检查是否输出"done"
+      if (summary.toLowerCase().includes("done")) {
+        setSummaryDone(true)
+        console.log("Summary done signal received")
+      }
+      
+      // 解析总结结果，提取setting、conflict、goal
+      // 格式应该是: setting: xxx\nconflict: xxx\ngoal: xxx
+      // 支持中英文冒号，提取到行尾或下一个字段前
+      const settingMatch = summary.match(/setting[：:]\s*([^\n\r]+?)(?=\n\s*(?:conflict|goal|done)|$)/i)
+      const conflictMatch = summary.match(/conflict[：:]\s*([^\n\r]+?)(?=\n\s*(?:goal|done|$)|$)/i)
+      const goalMatch = summary.match(/goal[：:]\s*([^\n\r]+?)(?=\n\s*(?:done|$)|$)/i)
+      
+      console.log("Extracted matches:", {
+        setting: settingMatch?.[1],
+        conflict: conflictMatch?.[1],
+        goal: goalMatch?.[1]
+      })
+
+      if (settingMatch && settingMatch[1].trim()) {
+        // 去掉可能的"setting:"前缀和多余空格
+        let newSetting = settingMatch[1].trim().replace(/^setting[：:]\s*/i, "").trim()
+        // Setting 允许单个单词，不进行长度检查
+        if (newSetting && newSetting.toLowerCase() !== "unknown" && newSetting !== plotData.setting) {
+          setUpdatingFields((prev) => new Set([...prev, "setting"]))
+          setPlotData((prev) => ({ ...prev, setting: newSetting }))
+          setTimeout(() => {
+            setUpdatingFields((prev) => {
+              const newSet = new Set(prev)
+              newSet.delete("setting")
+              return newSet
+            })
+          }, 1000)
+        } else if (newSetting && newSetting.toLowerCase() === "unknown") {
+          setPlotData((prev) => ({ ...prev, setting: "unknown" }))
+        }
+      }
+
+      if (conflictMatch && conflictMatch[1].trim()) {
+        // 去掉可能的"conflict:"前缀和多余空格
+        let newConflict = conflictMatch[1].trim().replace(/^conflict[：:]\s*/i, "").trim()
+        // 如果提取的内容太短（少于3个字符）或只是单个词，可能是提取错误，设为unknown
+        if (newConflict && newConflict.length < 3) {
+          newConflict = "unknown"
+        }
+        if (newConflict && newConflict.toLowerCase() !== "unknown" && newConflict !== plotData.conflict) {
+          setUpdatingFields((prev) => new Set([...prev, "conflict"]))
+          setPlotData((prev) => ({ ...prev, conflict: newConflict }))
+          setTimeout(() => {
+            setUpdatingFields((prev) => {
+              const newSet = new Set(prev)
+              newSet.delete("conflict")
+              return newSet
+            })
+          }, 1000)
+        } else if (newConflict && newConflict.toLowerCase() === "unknown") {
+          setPlotData((prev) => ({ ...prev, conflict: "unknown" }))
+        }
+      }
+
+      if (goalMatch && goalMatch[1].trim()) {
+        // 去掉可能的"goal:"前缀和多余空格
+        let newGoal = goalMatch[1].trim().replace(/^goal[：:]\s*/i, "").trim()
+        // 如果提取的内容太短（少于3个字符）或只是单个词，可能是提取错误，设为unknown
+        if (newGoal && newGoal.length < 3) {
+          newGoal = "unknown"
+        }
+        if (newGoal && newGoal.toLowerCase() !== "unknown" && newGoal !== plotData.goal) {
+          setUpdatingFields((prev) => new Set([...prev, "goal"]))
+          setPlotData((prev) => ({ ...prev, goal: newGoal }))
+          setTimeout(() => {
+            setUpdatingFields((prev) => {
+              const newSet = new Set(prev)
+              newSet.delete("goal")
+              return newSet
+            })
+          }, 1000)
+        } else if (newGoal && newGoal.toLowerCase() === "unknown") {
+          setPlotData((prev) => ({ ...prev, goal: "unknown" }))
+        }
+      }
+    } catch (error) {
+      console.error("Error summarizing plot:", error)
+      // 静默失败，不影响用户体验
+    }
+  }
+
+  const handleSuggestionClick = (suggestion: string) => {
+    sendMessage(suggestion)
+  }
+
+  // 检查是否可以继续：三个字段都不能是unknown或空
+  const canContinue = summaryDone && 
+    plotData.setting && 
+    plotData.setting.toLowerCase() !== "unknown" &&
+    plotData.conflict && 
+    plotData.conflict.toLowerCase() !== "unknown" &&
+    plotData.goal && 
+    plotData.goal.toLowerCase() !== "unknown"
+
+  const handleContinue = () => {
+    // Check if summary is done and all fields are not unknown
+    if (canContinue) {
+      onPlotCreate(plotData)
+    } else if (!summaryDone) {
+      toast.error("Please wait for the plot summary to complete")
+    } else {
+      toast.error("Please complete all plot fields (Setting, Conflict, Goal) before continuing")
+    }
+  }
+
+  return (
+    <div className="min-h-screen py-8 px-6 bg-gradient-to-br from-blue-100 via-cyan-50 via-purple-50 to-pink-50" style={{ paddingTop: '100px' }}>
+      <div className="max-w-7xl mx-auto">
+        <StageHeader stage={2} title="Brainstorm Your Plot" onBack={onBack} character={character?.name} />
+
+        <div className="grid lg:grid-cols-12 gap-6 mt-8">
+          <div className="lg:col-span-9">
+            <div className="bg-gradient-to-br from-white to-purple-50 rounded-2xl p-8 border-2 border-purple-200 shadow-2xl">
+              <div className="h-[600px] overflow-y-auto mb-6 space-y-4 pr-4">
+                {messages.map((message, index) => (
+                  <div
+                    key={index}
+                    className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                  >
+                    <div
+                      className={`max-w-[80%] rounded-2xl p-4 ${
+                        message.role === "user"
+                          ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white"
+                          : "bg-gradient-to-r from-purple-100 to-pink-100 text-gray-800 border-2 border-purple-200"
+                      }`}
+                    >
+                      <p className="text-base leading-relaxed">{message.content}</p>
+                      {message.suggestions && message.suggestions.length > 0 && message.role === "ai" && (
+                        <div className="mt-4 flex flex-nowrap gap-2">
+                          {message.suggestions.map((suggestion, i) => {
+                            // 去除单词中的逗号和其他标点
+                            const cleanSuggestion = suggestion.replace(/[,，、。.!?！？;；:：]/g, '').trim()
+                            return (
+                              <button
+                                key={i}
+                                onClick={() => handleSuggestionClick(cleanSuggestion)}
+                                className="px-3 py-2 bg-gradient-to-r from-purple-400 via-pink-400 to-purple-500 hover:from-purple-500 hover:via-pink-500 hover:to-purple-600 border-2 border-purple-400 rounded-xl text-xs font-bold text-white transition-all duration-300 hover:scale-110 active:scale-95 shadow-lg hover:shadow-2xl animate-bounce-in hover:animate-wiggle relative overflow-hidden group flex-shrink-0"
+                                style={{
+                                  animationDelay: `${i * 100}ms`,
+                                  animationFillMode: 'forwards',
+                                }}
+                              >
+                                {/* 背景光效 */}
+                                <span className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/30 to-white/0 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700"></span>
+                                <span className="relative z-10 whitespace-nowrap">
+                                  {cleanSuggestion}
+                                </span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {isLoading && (
+                  <div className="flex justify-start">
+                    <div className="bg-gradient-to-r from-purple-100 to-pink-100 rounded-2xl p-4 border-2 border-purple-200">
+                      <Loader2 className="h-5 w-5 animate-spin text-purple-600" />
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+
+              <div className="flex gap-3">
+                <Input
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault()
+                      sendMessage(input)
+                    }
+                  }}
+                  placeholder="Type your response..."
+                  className="flex-1 border-2 border-purple-200 focus:border-purple-500 rounded-xl"
+                  disabled={isLoading}
+                />
+                <Button
+                  onClick={() => sendMessage(input)}
+                  disabled={isLoading || !input.trim()}
+                  className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white border-0 shadow-xl"
+                >
+                  {isLoading ? (
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                  ) : (
+                    <Send className="h-5 w-5" />
+                  )}
+                </Button>
+              </div>
+
+              {summaryDone && (
+                <Button
+                  onClick={handleContinue}
+                  disabled={!canContinue}
+                  size="lg"
+                  className={`w-full mt-6 border-0 shadow-xl py-6 text-lg font-bold ${
+                    canContinue
+                      ? "bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-700 hover:via-purple-700 hover:to-pink-700 text-white animate-pulse"
+                      : "bg-gray-300 text-gray-500 cursor-not-allowed"
+                  }`}
+                >
+                  Continue to Story Structure →
+                </Button>
+              )}
+            </div>
+          </div>
+
+          <div className="lg:col-span-3 space-y-4">
+            {/* 角色图片 */}
+            {character?.imageUrl && (
+              <div className="bg-gradient-to-br from-indigo-50 to-purple-50 rounded-2xl p-4 border-2 border-indigo-200 shadow-xl">
+                <h3 className="text-lg font-bold mb-3 text-indigo-700">Your Character</h3>
+                <div className="relative overflow-hidden rounded-xl shadow-lg">
+                  <img
+                    src={character.imageUrl}
+                    alt={character.name}
+                    className="w-full h-auto object-cover"
+                  />
+                  <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent p-3">
+                    <p className="text-white font-bold text-sm">{character.name}</p>
+                    {character.species && (
+                      <p className="text-white/80 text-xs">{character.species}</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+            
+            {/* Plot Progress */}
+            <div className="bg-gradient-to-br from-blue-50 to-cyan-50 rounded-2xl p-6 border-2 border-blue-200 shadow-xl">
+              <h3 className="text-lg font-bold mb-4 text-blue-700 flex items-center gap-2">
+                <span>📊</span>
+                Plot Progress
+              </h3>
+              <div className="space-y-4">
+                <div className={`transition-all duration-500 ${updatingFields.has("setting") ? "animate-pulse scale-105" : ""}`}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-sm font-semibold text-gray-600">Setting</span>
+                    {plotData.setting && (
+                      <span className="w-2 h-2 bg-green-500 rounded-full animate-ping"></span>
+                    )}
+                  </div>
+                  <div className={`p-3 rounded-xl border-2 transition-all duration-500 ${
+                    plotData.setting 
+                      ? "bg-gradient-to-r from-blue-100 to-blue-200 border-blue-300 shadow-lg" 
+                      : "bg-gray-100 border-gray-200"
+                  }`}>
+                    <p className={`text-sm font-bold transition-all duration-500 ${
+                      plotData.setting && plotData.setting.toLowerCase() !== "unknown" ? "text-blue-800" : "text-gray-400"
+                    }`}>
+                      {plotData.setting && plotData.setting.toLowerCase() !== "unknown" ? plotData.setting : "unknown"}
+                    </p>
+                  </div>
+                </div>
+                <div className={`transition-all duration-500 ${updatingFields.has("conflict") ? "animate-pulse scale-105" : ""}`}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-sm font-semibold text-gray-600">Conflict</span>
+                    {plotData.conflict && (
+                      <span className="w-2 h-2 bg-purple-500 rounded-full animate-ping"></span>
+                    )}
+                  </div>
+                  <div className={`p-3 rounded-xl border-2 transition-all duration-500 ${
+                    plotData.conflict 
+                      ? "bg-gradient-to-r from-purple-100 to-purple-200 border-purple-300 shadow-lg" 
+                      : "bg-gray-100 border-gray-200"
+                  }`}>
+                    <p className={`text-sm font-bold transition-all duration-500 ${
+                      plotData.conflict && plotData.conflict.toLowerCase() !== "unknown" ? "text-purple-800" : "text-gray-400"
+                    }`}>
+                      {plotData.conflict && plotData.conflict.toLowerCase() !== "unknown" ? plotData.conflict : "unknown"}
+                    </p>
+                  </div>
+                </div>
+                <div className={`transition-all duration-500 ${updatingFields.has("goal") ? "animate-pulse scale-105" : ""}`}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-sm font-semibold text-gray-600">Goal</span>
+                    {plotData.goal && (
+                      <span className="w-2 h-2 bg-pink-500 rounded-full animate-ping"></span>
+                    )}
+                  </div>
+                  <div className={`p-3 rounded-xl border-2 transition-all duration-500 ${
+                    plotData.goal 
+                      ? "bg-gradient-to-r from-pink-100 to-pink-200 border-pink-300 shadow-lg" 
+                      : "bg-gray-100 border-gray-200"
+                  }`}>
+                    <p className={`text-sm font-bold transition-all duration-500 ${
+                      plotData.goal && plotData.goal.toLowerCase() !== "unknown" ? "text-pink-800" : "text-gray-400"
+                    }`}>
+                      {plotData.goal && plotData.goal.toLowerCase() !== "unknown" ? plotData.goal : "unknown"}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
